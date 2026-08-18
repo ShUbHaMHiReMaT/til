@@ -2,9 +2,14 @@ name: daily-activity
 
 on:
   schedule:
-    # 03:30 UTC == 09:00 IST. Cron in Actions is often delayed 5-30 min. That's normal.
+    # 03:30 UTC == 09:00 IST. Actions cron runs late under load, sometimes 30+ min.
     - cron: "30 3 * * *"
-  workflow_dispatch:        # lets you trigger it manually from the Actions tab
+  workflow_dispatch:
+
+# Prevents two runs colliding on the same daily/<date> branch.
+concurrency:
+  group: daily-activity
+  cancel-in-progress: false
 
 jobs:
   daily:
@@ -13,8 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # PAT (not GITHUB_TOKEN) so the commit + PR are attributed to YOU,
-          # not to github-actions[bot]. Bot activity does not count on your graph.
+          # PAT, not GITHUB_TOKEN — bot-authored commits do not count on your graph.
           token: ${{ secrets.GH_PAT }}
           fetch-depth: 0
 
@@ -23,30 +27,42 @@ jobs:
           git config user.name  "${{ vars.GIT_NAME }}"
           git config user.email "${{ vars.GIT_EMAIL }}"
 
-      - name: Create branch and commit
-        id: work
+      - name: Create branch and commits
         run: |
           set -euo pipefail
+          COUNT=10
           DATE="$(date -u +%F)"
           BRANCH="daily/${DATE}"
           echo "DATE=${DATE}"     >> "$GITHUB_ENV"
           echo "BRANCH=${BRANCH}" >> "$GITHUB_ENV"
+          echo "COUNT=${COUNT}"   >> "$GITHUB_ENV"
+
+          # If you already ran the manual script today, the branch exists remotely.
+          # Bail out cleanly rather than failing the run.
+          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+            echo "Branch ${BRANCH} already exists on remote. Nothing to do."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
           git checkout -b "${BRANCH}"
 
-          # ---- THE PAYLOAD ----------------------------------------------
-          # Replace this block with something that writes real content.
-          # Right now it appends a dated line to a monthly log file.
           mkdir -p log
           FILE="log/$(date -u +%Y-%m).md"
-          printf -- "- %s — automated entry\n" "$(date -u +'%Y-%m-%d %H:%M UTC')" >> "${FILE}"
-          # ---------------------------------------------------------------
 
-          git add -A
-          git commit -m "chore: daily log ${DATE}"
+          for i in $(seq 1 "${COUNT}"); do
+            # ---- PAYLOAD: swap for something that writes real content ----
+            printf -- "- %s — entry %02d\n" \
+              "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" "${i}" >> "${FILE}"
+            # --------------------------------------------------------------
+            git add -A
+            git commit -m "chore: log ${DATE} (${i}/${COUNT})" --quiet
+          done
+
           git push origin "${BRANCH}"
 
       - name: Open PR and merge it
+        if: env.SKIP != '1'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -55,8 +71,8 @@ jobs:
             --base "${{ github.event.repository.default_branch }}" \
             --head "${BRANCH}" \
             --title "Daily log ${DATE}" \
-            --body "Automated daily entry for ${DATE}."
+            --body "Automated entries for ${DATE}."
 
-          # Squash-merge onto the default branch. Commits only count toward the
-          # contribution graph once they land on the default branch.
-          gh pr merge "${BRANCH}" --squash --delete-branch
+          # --rebase replays all 10 commits onto the default branch individually.
+          # --squash would collapse them to one and you'd be back to a single commit.
+          gh pr merge "${BRANCH}" --rebase --delete-branch
